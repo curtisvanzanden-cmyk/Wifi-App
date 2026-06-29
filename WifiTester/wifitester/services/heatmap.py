@@ -17,6 +17,18 @@ except ImportError:
     gaussian_filter = None
 
 
+MIN_HEATMAP_POINTS = 3
+
+
+def image_bounds(width: int, height: int) -> Tuple[float, float, float, float]:
+    """Return (x_min, x_max, y_min, y_max) for a floorplan image."""
+    return (0.0, float(width), 0.0, float(height))
+
+
+def can_render_heatmap(point_count: int) -> bool:
+    return point_count >= MIN_HEATMAP_POINTS
+
+
 @dataclass
 class HeatmapConfig:
     method: str = "cubic"
@@ -29,6 +41,41 @@ class HeatmapConfig:
     dead_zone_threshold: float = -80.0
     contour_levels: int = 15
     heatmap_alpha: float = 0.6
+
+
+def render_inline_heatmap_layer(
+    ax,
+    xi: np.ndarray,
+    yi: np.ndarray,
+    zi: np.ndarray,
+    config: HeatmapConfig,
+    alpha: Optional[float] = None,
+) -> None:
+    """Draw heatmap contours on an existing axes (no colorbar/title)."""
+    zi_masked = np.ma.masked_invalid(zi)
+    cmap = plt.get_cmap(config.colormap)
+    heat_alpha = config.heatmap_alpha if alpha is None else alpha
+    ax.contourf(
+        xi,
+        yi,
+        zi_masked,
+        levels=config.contour_levels,
+        cmap=cmap,
+        alpha=heat_alpha,
+        zorder=2,
+    )
+
+    if config.show_dead_zones:
+        dead_zone_mask = zi < config.dead_zone_threshold
+        ax.contourf(
+            xi,
+            yi,
+            dead_zone_mask,
+            levels=[0.5, 1.5],
+            colors=["red"],
+            alpha=0.25,
+            zorder=3,
+        )
 
 
 def _nearest_neighbor_grid(

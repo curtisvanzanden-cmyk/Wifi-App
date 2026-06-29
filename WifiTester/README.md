@@ -34,17 +34,22 @@ python -m wifitester
 
 ## Quick start
 
-1. **File → New Project** (or use the default project)
-2. **Select Floorplan** and choose an image (PNG/JPG)
-3. **Start Measuring** and click points on the map
-4. **Generate Heatmap** to visualize coverage
+1. Run the app — a **Getting Started** wizard appears on first launch
+2. Enter project details and **load a floorplan** image (PNG/JPG)
+3. The map enters **survey mode** automatically — click points to record signal
+4. Switch **Map view** to Points, Heatmap, or Overlay in the sidebar
 5. **Save Project** to store measurements and metadata (`.wifiproj`)
 
 Projects auto-save every 5 minutes. Unsaved work is written to `~/.config/wifitester/autosave/autosave.wifiproj`.
 
-## Test mode
+### Survey workflow
 
-Enable **Test Mode (Simulate)** in the sidebar to add measurements without live WiFi hardware.
+- **Live signal** is shown in the toolbar while you work
+- Each click **samples WiFi several times** and stores the median RSSI
+- Heatmap view requires at least **3 measurement points**
+- Use **Test mode** in the sidebar when WiFi hardware is unavailable
+
+Reopen the wizard anytime via **Help → Getting Started**.
 
 ## Development
 
@@ -62,9 +67,14 @@ WifiTester/
 ├── wifitester/
 │   ├── app.py              # Tkinter UI
 │   ├── models/project.py   # Project and measurement models
-│   └── services/
-│       ├── wifi_scanner.py # Cross-platform WiFi scanning
-│       └── heatmap.py      # Heatmap interpolation and rendering
+│   ├── services/
+│   │   ├── wifi_scanner.py # Cross-platform WiFi scanning
+│   │   ├── heatmap.py      # Heatmap interpolation and rendering
+│   │   ├── sampler.py      # Multi-sample RSSI median
+│   │   └── settings.py     # User preferences persistence
+│   └── ui/
+│       ├── signal_style.py # Colors and map legend
+│       └── dialogs/        # Onboarding wizard
 ├── tests/
 └── legacy/                 # Earlier prototype scripts
 ```

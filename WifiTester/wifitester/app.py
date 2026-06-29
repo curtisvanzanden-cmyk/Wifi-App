@@ -13,7 +13,7 @@ except Exception as e:
     raise RuntimeError("Tkinter required: " + str(e))
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageTk
 except Exception:
     raise RuntimeError("Pillow required: pip install pillow")
 
@@ -29,8 +29,19 @@ except Exception:
 
 from wifitester import __version__
 from wifitester.models.project import MeasurementPoint, Project
-from wifitester.services.heatmap import HeatmapConfig, create_heatmap_figure
+from wifitester.services.heatmap import (
+    HeatmapConfig,
+    can_render_heatmap,
+    create_heatmap_figure,
+    image_bounds,
+    interpolate_signal_grid,
+    render_inline_heatmap_layer,
+)
+from wifitester.services.sampler import median_rssi
+from wifitester.services.settings import load_settings, save_settings
 from wifitester.services.wifi_scanner import WiFiScanner
+from wifitester.ui.dialogs.onboarding import OnboardingWizard, show_onboarding_if_needed
+from wifitester.ui.signal_style import MIN_HEATMAP_POINTS, draw_signal_legend, rssi_to_color
 
 
 AUTOSAVE_DIR = Path.home() / ".config" / "wifitester" / "autosave"
@@ -49,20 +60,29 @@ class WiFiHeatmapPro:
         self.project = Project()
         self.current_file: Optional[str] = None
         self.image = None
-        self.comparison_project: Optional[Project] = None
-        
+        self.settings = load_settings()
+        self._floorplan_photo = None
+
         # UI state
         self.measuring = False
+        self.sampling_active = False
         self.auto_save_enabled = True
         self.auto_save_interval = 300000  # 5 minutes
-        
+        self._live_wifi_info = None
+        self._pending_sample: Optional[dict] = None
+        self._sample_readings: list[float] = []
+        self._sample_wifi_meta: list[dict] = []
+
         # Matplotlib setup
         self.fig: Figure = Figure(figsize=(10, 8))
         self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas = None
         self.cid_click = None
-        
+
         # Configuration
+        self.view_mode = tk.StringVar(value="points")
+        self.overlay_opacity = tk.DoubleVar(value=0.6)
+        self.show_advanced = tk.BooleanVar(value=False)
         self.interpolate_method = tk.StringVar(value="cubic")
         self.colormap = tk.StringVar(value="RdYlGn")
         self.grid_res = tk.IntVar(value=300)
@@ -75,10 +95,20 @@ class WiFiHeatmapPro:
         self.simulate_mode = tk.BooleanVar(value=False)
         self.sim_rssi = tk.IntVar(value=-60)
         self.smoothing_sigma = tk.DoubleVar(value=1.0)
-        
+        self.live_rssi_text = tk.StringVar(value="Signal: —")
+
+        self.view_mode.trace_add("write", lambda *_: self.refresh_view())
+        self.overlay_opacity.trace_add("write", lambda *_: self.refresh_view())
+        self.show_points.trace_add("write", lambda *_: self.refresh_view())
+        self.show_labels.trace_add("write", lambda *_: self.refresh_view())
+        self.show_grid.trace_add("write", lambda *_: self.refresh_view())
+        self.show_dead_zones.trace_add("write", lambda *_: self.refresh_view())
+
         self._build_ui()
         self._setup_auto_save()
+        self._start_live_rssi_poll()
         self._log("WiFi Heatmap Pro initialized")
+        self.root.after(300, self._maybe_show_onboarding)
     
     # ==================== UI BUILDING ====================
     
@@ -130,16 +160,19 @@ class WiFiHeatmapPro:
         # Tools menu
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Generate Heatmap", command=self.generate_heatmap, accelerator="Ctrl+G")
+        tools_menu.add_command(label="Show Heatmap on Map", command=self.show_heatmap_view, accelerator="Ctrl+G")
         tools_menu.add_command(label="Export Image...", command=self.export_image)
         tools_menu.add_command(label="Generate Report...", command=self.generate_report)
         tools_menu.add_separator()
         tools_menu.add_command(label="Calibrate Scale...", command=self.calibrate_dialog)
-        tools_menu.add_command(label="Compare Projects...", command=self.compare_projects)
         
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_radiobutton(label="Points only", variable=self.view_mode, value="points")
+        view_menu.add_radiobutton(label="Heatmap only", variable=self.view_mode, value="heatmap")
+        view_menu.add_radiobutton(label="Heatmap overlay", variable=self.view_mode, value="overlay")
+        view_menu.add_separator()
         view_menu.add_checkbutton(label="Show Points", variable=self.show_points)
         view_menu.add_checkbutton(label="Show Labels", variable=self.show_labels)
         view_menu.add_checkbutton(label="Show Grid", variable=self.show_grid)
@@ -148,6 +181,7 @@ class WiFiHeatmapPro:
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Getting Started...", command=self.show_getting_started)
         help_menu.add_command(label="About", command=self.show_about)
         
         # Keyboard shortcuts
@@ -155,95 +189,160 @@ class WiFiHeatmapPro:
         self.root.bind('<Control-o>', lambda e: self.open_project())
         self.root.bind('<Control-s>', lambda e: self.save_project())
         self.root.bind('<Control-Shift-S>', lambda e: self.save_project_as())
-        self.root.bind('<Control-g>', lambda e: self.generate_heatmap())
+        self.root.bind('<Control-g>', lambda e: self.show_heatmap_view())
         self.root.bind('<Control-z>', lambda e: self.undo_last())
     
     def _build_left_panel(self, parent):
-        """Build left control panel"""
-        # Make it scrollable
-        canvas = tk.Canvas(parent)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        """Build simplified left control panel."""
+        panel = ttk.Frame(parent, padding=8)
+        panel.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(panel, text="Project", font=("Arial", 11, "bold")).pack(anchor=tk.W)
+        self.project_name_label = ttk.Label(panel, text=self.project.metadata.name, wraplength=260)
+        self.project_name_label.pack(anchor=tk.W, pady=(4, 8))
+
+        self.thumbnail_label = ttk.Label(panel, text="No floorplan loaded", relief=tk.SUNKEN)
+        self.thumbnail_label.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Button(panel, text="Load Floorplan", command=self.select_floorplan).pack(fill=tk.X, pady=2)
+        ttk.Button(panel, text="Project Settings", command=self.edit_project_settings).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(panel).pack(fill=tk.X, pady=10)
+
+        ttk.Label(panel, text="Survey", font=("Arial", 11, "bold")).pack(anchor=tk.W)
+        self.measure_btn = ttk.Button(panel, text="Start Surveying", command=self.toggle_measuring)
+        self.measure_btn.pack(fill=tk.X, pady=4)
+        ttk.Button(panel, text="Undo Last", command=self.undo_last).pack(fill=tk.X, pady=2)
+        ttk.Button(panel, text="Clear All", command=self.clear_all).pack(fill=tk.X, pady=2)
+
+        ttk.Checkbutton(panel, text="Test mode (simulate RSSI)", variable=self.simulate_mode).pack(
+            anchor=tk.W, pady=(8, 2)
         )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Project section
-        ttk.Label(scrollable_frame, text="📁 Project", font=('Arial', 11, 'bold')).pack(anchor=tk.W, padx=8, pady=(8,4))
-        ttk.Button(scrollable_frame, text="Select Floorplan", command=self.select_floorplan).pack(fill=tk.X, padx=8, pady=2)
-        ttk.Button(scrollable_frame, text="Project Settings", command=self.edit_project_settings).pack(fill=tk.X, padx=8, pady=2)
-        
-        ttk.Separator(scrollable_frame).pack(fill=tk.X, pady=8)
-        
-        # Measurement section
-        ttk.Label(scrollable_frame, text="📡 Measurement", font=('Arial', 11, 'bold')).pack(anchor=tk.W, padx=8, pady=(8,4))
-        self.measure_btn = ttk.Button(scrollable_frame, text="▶ Start Measuring", command=self.toggle_measuring)
-        self.measure_btn.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Button(scrollable_frame, text="↶ Undo Last", command=self.undo_last).pack(fill=tk.X, padx=8, pady=2)
-        ttk.Button(scrollable_frame, text="🗑 Clear All", command=self.clear_all).pack(fill=tk.X, padx=8, pady=2)
-        
-        # Test mode
-        ttk.Checkbutton(scrollable_frame, text="Test Mode (Simulate)", variable=self.simulate_mode).pack(anchor=tk.W, padx=8, pady=(8,2))
-        sim_frame = ttk.Frame(scrollable_frame)
-        sim_frame.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Label(sim_frame, text="RSSI:").pack(side=tk.LEFT)
-        ttk.Spinbox(sim_frame, from_=-100, to=-20, textvariable=self.sim_rssi, width=6).pack(side=tk.LEFT, padx=4)
-        
-        ttk.Separator(scrollable_frame).pack(fill=tk.X, pady=8)
-        
-        # Visualization section
-        ttk.Label(scrollable_frame, text="🎨 Visualization", font=('Arial', 11, 'bold')).pack(anchor=tk.W, padx=8, pady=(8,4))
-        
-        ttk.Label(scrollable_frame, text="Interpolation:").pack(anchor=tk.W, padx=8)
-        ttk.Combobox(scrollable_frame, textvariable=self.interpolate_method, 
-                     values=["cubic", "linear", "nearest"], state='readonly', width=18).pack(padx=8, pady=2)
-        
-        ttk.Label(scrollable_frame, text="Colormap:").pack(anchor=tk.W, padx=8, pady=(6,0))
-        ttk.Combobox(scrollable_frame, textvariable=self.colormap,
-                     values=["RdYlGn", "viridis", "plasma", "coolwarm", "jet"], state='readonly', width=18).pack(padx=8, pady=2)
-        
-        ttk.Label(scrollable_frame, text="Resolution:").pack(anchor=tk.W, padx=8, pady=(6,0))
-        ttk.Scale(scrollable_frame, from_=50, to=500, variable=self.grid_res, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=2)
-        
-        ttk.Label(scrollable_frame, text="Smoothing:").pack(anchor=tk.W, padx=8, pady=(6,0))
-        ttk.Scale(scrollable_frame, from_=0, to=5, variable=self.smoothing_sigma, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=2)
-        
-        ttk.Checkbutton(scrollable_frame, text="Show measurement points", variable=self.show_points).pack(anchor=tk.W, padx=8, pady=2)
-        ttk.Checkbutton(scrollable_frame, text="Show RSSI labels", variable=self.show_labels).pack(anchor=tk.W, padx=8, pady=2)
-        ttk.Checkbutton(scrollable_frame, text="Show colorbar", variable=self.show_colorbar).pack(anchor=tk.W, padx=8, pady=2)
-        ttk.Checkbutton(scrollable_frame, text="Highlight dead zones", variable=self.show_dead_zones).pack(anchor=tk.W, padx=8, pady=2)
-        
-        ttk.Separator(scrollable_frame).pack(fill=tk.X, pady=8)
-        
-        # Grid overlay
-        ttk.Label(scrollable_frame, text="📐 Grid Overlay", font=('Arial', 11, 'bold')).pack(anchor=tk.W, padx=8, pady=(8,4))
-        ttk.Checkbutton(scrollable_frame, text="Show grid", variable=self.show_grid).pack(anchor=tk.W, padx=8, pady=2)
-        ttk.Label(scrollable_frame, text="Spacing (pixels):").pack(anchor=tk.W, padx=8)
-        ttk.Spinbox(scrollable_frame, from_=10, to=200, textvariable=self.grid_spacing, width=18).pack(padx=8, pady=2)
-        
-        ttk.Separator(scrollable_frame).pack(fill=tk.X, pady=8)
-        
-        ttk.Button(scrollable_frame, text="🔄 Refresh View", command=self.refresh_view).pack(fill=tk.X, padx=8, pady=8)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        sim_frame = ttk.Frame(panel)
+        sim_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(sim_frame, text="Simulated RSSI:").pack(side=tk.LEFT)
+        ttk.Spinbox(sim_frame, from_=-100, to=-20, textvariable=self.sim_rssi, width=6).pack(
+            side=tk.LEFT, padx=4
+        )
+
+        ttk.Separator(panel).pack(fill=tk.X, pady=10)
+
+        ttk.Label(panel, text="Map view", font=("Arial", 11, "bold")).pack(anchor=tk.W)
+        for label, value in (
+            ("Points", "points"),
+            ("Heatmap", "heatmap"),
+            ("Overlay", "overlay"),
+        ):
+            ttk.Radiobutton(panel, text=label, variable=self.view_mode, value=value).pack(anchor=tk.W)
+
+        self.heatmap_hint_label = ttk.Label(
+            panel,
+            text=f"Add {MIN_HEATMAP_POINTS}+ points to enable heatmap.",
+            foreground="#666666",
+            wraplength=260,
+        )
+        self.heatmap_hint_label.pack(anchor=tk.W, pady=(6, 0))
+
+        ttk.Label(panel, text="Overlay opacity").pack(anchor=tk.W, pady=(8, 0))
+        ttk.Scale(panel, from_=0.2, to=1.0, variable=self.overlay_opacity, orient=tk.HORIZONTAL).pack(
+            fill=tk.X
+        )
+
+        ttk.Separator(panel).pack(fill=tk.X, pady=10)
+
+        ttk.Button(panel, text="Export Image", command=self.export_image).pack(fill=tk.X, pady=2)
+        ttk.Button(panel, text="Export CSV", command=self.export_csv).pack(fill=tk.X, pady=2)
+        ttk.Button(panel, text="Generate Report", command=self.generate_report).pack(fill=tk.X, pady=2)
+
+        ttk.Separator(panel).pack(fill=tk.X, pady=10)
+
+        ttk.Checkbutton(
+            panel,
+            text="Show advanced settings",
+            variable=self.show_advanced,
+            command=self._toggle_advanced_panel,
+        ).pack(anchor=tk.W)
+
+        self.advanced_frame = ttk.LabelFrame(panel, text="Advanced", padding=6)
+        self._build_advanced_panel(self.advanced_frame)
+
+        ttk.Separator(panel).pack(fill=tk.X, pady=10)
+        ttk.Button(panel, text="Refresh View", command=self.refresh_view).pack(fill=tk.X, pady=2)
+
+    def _build_advanced_panel(self, parent):
+        ttk.Label(parent, text="Interpolation").pack(anchor=tk.W)
+        ttk.Combobox(
+            parent,
+            textvariable=self.interpolate_method,
+            values=["cubic", "linear", "nearest"],
+            state="readonly",
+            width=18,
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Label(parent, text="Colormap").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Combobox(
+            parent,
+            textvariable=self.colormap,
+            values=["RdYlGn", "viridis", "plasma", "coolwarm", "jet"],
+            state="readonly",
+            width=18,
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Label(parent, text="Resolution").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Scale(parent, from_=50, to=500, variable=self.grid_res, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        ttk.Label(parent, text="Smoothing").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Scale(parent, from_=0, to=5, variable=self.smoothing_sigma, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        ttk.Checkbutton(parent, text="Show colorbar on export", variable=self.show_colorbar).pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(parent, text="Show grid", variable=self.show_grid).pack(anchor=tk.W, pady=2)
+        ttk.Label(parent, text="Grid spacing (px)").pack(anchor=tk.W)
+        ttk.Spinbox(parent, from_=10, to=200, textvariable=self.grid_spacing, width=18).pack(fill=tk.X, pady=2)
+
+    def _toggle_advanced_panel(self):
+        if self.show_advanced.get():
+            self.advanced_frame.pack(fill=tk.X, pady=(6, 0))
+        else:
+            self.advanced_frame.pack_forget()
     
     def _build_center_panel(self, parent):
-        """Build center canvas area"""
+        """Build center canvas area with toolbar and inline map."""
         toolbar_frame = ttk.Frame(parent)
         toolbar_frame.pack(fill=tk.X, padx=4, pady=4)
-        
-        ttk.Button(toolbar_frame, text="🖼 Generate Heatmap", command=self.generate_heatmap).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar_frame, text="💾 Export Image", command=self.export_image).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar_frame, text="📄 Generate Report", command=self.generate_report).pack(side=tk.LEFT, padx=2)
-        
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.ax.axis('off')
+
+        self.live_rssi_label = ttk.Label(
+            toolbar_frame,
+            textvariable=self.live_rssi_text,
+            font=("Arial", 10, "bold"),
+        )
+        self.live_rssi_label.pack(side=tk.LEFT, padx=(4, 16))
+
+        ttk.Button(toolbar_frame, text="Load Floorplan", command=self.select_floorplan).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(toolbar_frame, text="Show Heatmap", command=self.show_heatmap_view).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(toolbar_frame, text="Export Image", command=self.export_image).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        self.banner_frame = ttk.Frame(parent)
+        self.banner_frame.pack(fill=tk.X, padx=4)
+        self.banner_label = ttk.Label(
+            self.banner_frame,
+            text="",
+            foreground="#b45309",
+            wraplength=900,
+        )
+        self.banner_label.pack(fill=tk.X, padx=4, pady=2)
+        self.banner_frame.pack_forget()
+
+        self.canvas_host = ttk.Frame(parent)
+        self.canvas_host.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.canvas_host)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.ax.axis("off")
         self.canvas.draw()
     
     def _build_right_panel(self, parent):
@@ -316,6 +415,8 @@ class WiFiHeatmapPro:
         self.project = Project()
         self.current_file = None
         self.image = None
+        self._stop_measuring()
+        self._update_floorplan_thumbnail()
         self.refresh_view()
         self.update_info_panels()
         self._log("New project created", "SUCCESS")
@@ -337,8 +438,11 @@ class WiFiHeatmapPro:
             # Load floorplan if path exists
             if self.project.metadata.floorplan_path and os.path.exists(self.project.metadata.floorplan_path):
                 self._load_floorplan(self.project.metadata.floorplan_path)
-            
-            self.refresh_view()
+            else:
+                self.image = None
+                self._update_floorplan_thumbnail()
+                self.refresh_view()
+
             self.update_info_panels()
             self._log(f"Project loaded: {filepath}", "SUCCESS")
             self.root.title(f"WiFi Heatmap Pro - {self.project.metadata.name}")
@@ -410,6 +514,7 @@ class WiFiHeatmapPro:
             self.project.metadata.floor = floor_var.get()
             self.project.metadata.surveyor = surv_var.get()
             self.project.metadata.notes = notes_text.get('1.0', tk.END).strip()
+            self._update_floorplan_thumbnail()
             self._log("Project settings updated", "SUCCESS")
             dialog.destroy()
         
@@ -432,102 +537,235 @@ class WiFiHeatmapPro:
             return
         
         self._load_floorplan(filepath)
-        self.project.metadata.floorplan_path = filepath
         self._log(f"Floorplan loaded: {filepath}", "SUCCESS")
     
     def _load_floorplan(self, filepath: str):
         """Load floorplan image"""
         try:
             self.image = Image.open(filepath)
+            self.project.metadata.floorplan_path = filepath
+            self._update_floorplan_thumbnail()
             self.refresh_view()
+            self._start_measuring()
+            self._hide_wifi_banner()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load image: {e}")
             self._log(f"Image load failed: {e}", "ERROR")
-    
+
+    def _update_floorplan_thumbnail(self):
+        self.project_name_label.config(text=self.project.metadata.name)
+        if not self.image:
+            self.thumbnail_label.config(image="", text="No floorplan loaded")
+            self._floorplan_photo = None
+            return
+
+        thumb = self.image.copy()
+        thumb.thumbnail((220, 140))
+        self._floorplan_photo = ImageTk.PhotoImage(thumb)
+        self.thumbnail_label.config(image=self._floorplan_photo, text="")
+
+    def _update_heatmap_hint(self):
+        count = len(self.project.measurements)
+        remaining = max(0, MIN_HEATMAP_POINTS - count)
+        if remaining:
+            self.heatmap_hint_label.config(
+                text=f"Add {remaining} more point(s) to enable heatmap view."
+            )
+        else:
+            self.heatmap_hint_label.config(text="Heatmap view is available.")
+
+    def _maybe_show_onboarding(self):
+        show_onboarding_if_needed(
+            self.root,
+            self.settings,
+            on_complete=self._apply_onboarding,
+            on_skip=self._skip_onboarding,
+        )
+
+    def show_getting_started(self):
+        OnboardingWizard(
+            self.root,
+            on_complete=self._apply_onboarding,
+            on_skip=lambda: None,
+        )
+
+    def _skip_onboarding(self):
+        self.settings["onboarding_completed"] = True
+        save_settings(self.settings)
+
+    def _apply_onboarding(self, data: dict):
+        self.project.metadata.name = data.get("project_name", "New Survey")
+        self.project.metadata.location = data.get("location", "")
+        self.project.metadata.surveyor = data.get("surveyor", "")
+        self.simulate_mode.set(bool(data.get("simulate_mode", False)))
+        self.settings["onboarding_completed"] = True
+        save_settings(self.settings)
+        self._update_floorplan_thumbnail()
+        self.root.title(f"WiFi Heatmap Pro - {self.project.metadata.name}")
+
+        floorplan = data.get("floorplan_path", "")
+        if floorplan and os.path.exists(floorplan):
+            self._load_floorplan(floorplan)
+        else:
+            self.refresh_view()
+
+        self._log("Onboarding complete — ready to survey", "SUCCESS")
+
+    def _start_live_rssi_poll(self):
+        if not self.simulate_mode.get():
+            self._live_wifi_info = WiFiScanner.get_detailed_info()
+        else:
+            self._live_wifi_info = {
+                "rssi": self.sim_rssi.get(),
+                "ssid": "SimulatedAP",
+                "bssid": "",
+                "channel": 6,
+            }
+
+        if self._live_wifi_info and self._live_wifi_info.get("rssi") is not None:
+            ssid = self._live_wifi_info.get("ssid") or "Unknown"
+            self.live_rssi_text.set(
+                f"Signal: {self._live_wifi_info['rssi']} dBm · {ssid}"
+            )
+            if not self.simulate_mode.get() and self.image and not self.sampling_active:
+                self._hide_wifi_banner()
+        else:
+            self.live_rssi_text.set("Signal: unavailable")
+            if self.image and not self.simulate_mode.get():
+                self._show_wifi_banner(
+                    "Cannot read WiFi signal. Enable Test mode in the sidebar or check your connection."
+                )
+
+        interval = int(self.settings.get("live_rssi_interval_ms", 500))
+        self.root.after(interval, self._start_live_rssi_poll)
+
+    def _show_wifi_banner(self, message: str):
+        self.banner_label.config(text=message)
+        if not self.banner_frame.winfo_ismapped():
+            self.banner_frame.pack(fill=tk.X, padx=4, pady=(0, 4), before=self.canvas_host)
+
+    def _hide_wifi_banner(self):
+        self.banner_frame.pack_forget()
+
     # ==================== MEASUREMENT ====================
+
+    def _start_measuring(self):
+        if not self.image or self.measuring:
+            return
+        self.measuring = True
+        self.measure_btn.config(text="Pause Surveying")
+        self.cid_click = self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        self.canvas.get_tk_widget().config(cursor="crosshair")
+        self.status_label.config(text="Surveying — click the map to record a point")
+        self._log("Survey mode started", "INFO")
+
+    def _stop_measuring(self):
+        if not self.measuring:
+            return
+        self.measuring = False
+        self.measure_btn.config(text="Start Surveying")
+        if self.cid_click:
+            self.canvas.mpl_disconnect(self.cid_click)
+            self.cid_click = None
+        self.canvas.get_tk_widget().config(cursor="")
+        self.status_label.config(text="Surveying paused")
+        self._log("Survey mode paused", "INFO")
     
     def toggle_measuring(self):
         """Start/stop measurement mode"""
         if not self.image:
-            messagebox.showwarning("No Floorplan", "Please select a floorplan first.")
+            messagebox.showwarning("No Floorplan", "Load a floorplan image to begin surveying.")
             return
-        
-        if not self.measuring:
-            self.measuring = True
-            self.measure_btn.config(text="⏸ Stop Measuring")
-            self.cid_click = self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
-            self._log("Measurement mode started", "INFO")
-            self.status_label.config(text="Click on floorplan to record measurements")
+
+        if self.measuring:
+            self._stop_measuring()
+            self.refresh_view()
         else:
-            self.measuring = False
-            self.measure_btn.config(text="▶ Start Measuring")
-            if self.cid_click:
-                self.canvas.mpl_disconnect(self.cid_click)
-                self.cid_click = None
-            self._log("Measurement mode stopped", "INFO")
-            self.status_label.config(text="Ready")
-    
+            self._start_measuring()
+
     def _on_canvas_click(self, event):
         """Handle canvas click during measurement"""
-        if not self.measuring or event.inaxes != self.ax:
+        if not self.measuring or self.sampling_active or event.inaxes != self.ax:
             return
         if event.xdata is None or event.ydata is None:
             return
-        
+
         x, y = int(event.xdata), int(event.ydata)
-        
-        # Get WiFi info
+        self._pending_sample = {"x": x, "y": y}
+        self._sample_readings = []
+        self._sample_wifi_meta = []
+        self.sampling_active = True
+        self.status_label.config(text=f"Sampling at ({x}, {y})...")
+        self._collect_sample_reading()
+
+    def _collect_sample_reading(self):
+        if not self._pending_sample:
+            self.sampling_active = False
+            return
+
         if self.simulate_mode.get():
             wifi_info = {
-                'rssi': self.sim_rssi.get(),
-                'ssid': 'SimulatedAP',
-                'bssid': 'XX:XX:XX:XX:XX:XX',
-                'channel': 6
+                "rssi": self.sim_rssi.get(),
+                "ssid": "SimulatedAP",
+                "bssid": "XX:XX:XX:XX:XX:XX",
+                "channel": 6,
             }
         else:
             wifi_info = WiFiScanner.get_detailed_info()
-            if not wifi_info or wifi_info['rssi'] is None:
-                messagebox.showwarning("No Signal", "Could not read WiFi signal. Enable Test Mode or check connection.")
+            if not wifi_info or wifi_info.get("rssi") is None:
+                self.sampling_active = False
+                self._pending_sample = None
+                self._show_wifi_banner(
+                    "Could not read WiFi signal. Enable Test mode or check your connection."
+                )
+                self.status_label.config(text="Measurement failed — no WiFi signal")
                 return
-        
-        # Create measurement point
+
+        self._sample_readings.append(float(wifi_info["rssi"]))
+        self._sample_wifi_meta.append(wifi_info)
+
+        target = int(self.settings.get("sample_count", 5))
+        if len(self._sample_readings) < target:
+            self.status_label.config(
+                text=f"Sampling {len(self._sample_readings)}/{target} at "
+                f"({self._pending_sample['x']}, {self._pending_sample['y']})..."
+            )
+            interval = int(self.settings.get("sample_interval_ms", 300))
+            self.root.after(interval, self._collect_sample_reading)
+            return
+
+        self._finish_sampled_measurement()
+
+    def _finish_sampled_measurement(self):
+        pending = self._pending_sample or {}
+        x, y = pending.get("x", 0), pending.get("y", 0)
+        rssi = median_rssi(self._sample_readings)
+        latest = self._sample_wifi_meta[-1] if self._sample_wifi_meta else {}
+
         point = MeasurementPoint(
             x=x,
             y=y,
-            rssi=wifi_info['rssi'],
+            rssi=rssi if rssi is not None else latest.get("rssi", -70),
             timestamp=datetime.now().isoformat(),
-            ssid=wifi_info.get('ssid', ''),
-            bssid=wifi_info.get('bssid', ''),
-            channel=wifi_info.get('channel', 0)
+            ssid=latest.get("ssid", ""),
+            bssid=latest.get("bssid", ""),
+            channel=latest.get("channel", 0),
         )
-        
+
         self.project.add_measurement(point)
-        self._draw_measurement_point(point)
+        self.sampling_active = False
+        self._pending_sample = None
+        self._sample_readings = []
+        self._sample_wifi_meta = []
+
+        self.refresh_view()
         self.update_info_panels()
-        self._log(f"Measurement added: ({x},{y}) = {wifi_info['rssi']} dBm [{wifi_info.get('ssid', 'Unknown')}]", "SUCCESS")
-    
-    def _draw_measurement_point(self, point: MeasurementPoint):
-        """Draw a single measurement point"""
-        if self.show_points.get():
-            # Color based on signal strength
-            if point.rssi > -60:
-                color = 'green'
-            elif point.rssi > -70:
-                color = 'yellow'
-            elif point.rssi > -80:
-                color = 'orange'
-            else:
-                color = 'red'
-            
-            self.ax.plot(point.x, point.y, marker='o', markersize=8, 
-                        markerfacecolor=color, markeredgecolor='black', markeredgewidth=1.5)
-            
-            if self.show_labels.get():
-                self.ax.text(point.x + 5, point.y, f"{point.rssi}", 
-                           fontsize=8, color='black',
-                           bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
-        
-        self.canvas.draw()
+        self._log(
+            f"Point {len(self.project.measurements)}: ({x},{y}) = {point.rssi:.0f} dBm "
+            f"[{point.ssid or 'Unknown'}]",
+            "SUCCESS",
+        )
+        self.status_label.config(text=f"Recorded point {len(self.project.measurements)}")
     
     def undo_last(self):
         """Remove last measurement"""
@@ -556,43 +794,127 @@ class WiFiHeatmapPro:
     # ==================== VISUALIZATION ====================
     
     def refresh_view(self):
-        """Refresh the canvas view"""
+        """Refresh the canvas view with optional inline heatmap."""
         self.ax.clear()
-        
-        if self.image:
-            self.ax.imshow(self.image)
-            
-            # Draw grid if enabled
-            if self.show_grid.get():
-                self._draw_grid()
-            
-            # Draw all measurement points
+        self._update_heatmap_hint()
+
+        if not self.image:
+            self.ax.text(
+                0.5,
+                0.55,
+                "Load a floorplan to begin your survey",
+                ha="center",
+                va="center",
+                fontsize=14,
+                transform=self.ax.transAxes,
+            )
+            self.ax.text(
+                0.5,
+                0.45,
+                "Use Load Floorplan in the sidebar or toolbar",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#666666",
+                transform=self.ax.transAxes,
+            )
+            self.ax.set_title("WiFi Heatmap Pro")
+            self.ax.axis("off")
+            self.canvas.draw()
+            return
+
+        mode = self.view_mode.get()
+        show_floorplan = mode in ("points", "overlay")
+        show_heatmap = mode in ("heatmap", "overlay")
+
+        if show_floorplan:
+            self.ax.imshow(self.image, zorder=1)
+
+        if self.show_grid.get():
+            self._draw_grid()
+
+        if show_heatmap and can_render_heatmap(len(self.project.measurements)):
+            try:
+                self._draw_inline_heatmap(mode)
+            except Exception as exc:
+                self._log(f"Inline heatmap failed: {exc}", "ERROR")
+        elif show_heatmap:
+            self.ax.text(
+                0.5,
+                0.95,
+                f"Need {MIN_HEATMAP_POINTS}+ points for heatmap (have {len(self.project.measurements)})",
+                ha="center",
+                va="top",
+                transform=self.ax.transAxes,
+                fontsize=9,
+                color="#666666",
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+            )
+
+        if self.show_points.get() or mode == "points":
             for point in self.project.measurements:
                 self._draw_measurement_point_static(point)
-        
-        self.ax.set_title('Floorplan - Click to measure' if self.measuring else 'Floorplan')
-        self.ax.axis('off')
+
+        draw_signal_legend(self.ax)
+
+        title = "Surveying — click to measure" if self.measuring else self.project.metadata.name
+        self.ax.set_title(title)
+        self.ax.axis("off")
         self.canvas.draw()
-    
+
+    def _draw_inline_heatmap(self, mode: str):
+        x_coords = [m.x for m in self.project.measurements]
+        y_coords = [m.y for m in self.project.measurements]
+        z_values = [m.rssi for m in self.project.measurements]
+        width, height = self.image.size
+        bounds = image_bounds(width, height)
+
+        config = self._heatmap_config()
+        config.show_colorbar = False
+        config.show_points = False
+
+        xi, yi, zi = interpolate_signal_grid(
+            x_coords,
+            y_coords,
+            z_values,
+            bounds,
+            config,
+        )
+
+        alpha = 1.0 if mode == "heatmap" else self.overlay_opacity.get()
+        if mode == "heatmap":
+            self.ax.clear()
+            self.ax.imshow(self.image, zorder=1)
+
+        render_inline_heatmap_layer(self.ax, xi, yi, zi, config, alpha=alpha)
+
     def _draw_measurement_point_static(self, point: MeasurementPoint):
-        """Draw point without updating canvas (for batch drawing)"""
-        if self.show_points.get():
-            if point.rssi > -60:
-                color = 'green'
-            elif point.rssi > -70:
-                color = 'yellow'
-            elif point.rssi > -80:
-                color = 'orange'
-            else:
-                color = 'red'
-            
-            self.ax.plot(point.x, point.y, marker='o', markersize=8,
-                        markerfacecolor=color, markeredgecolor='black', markeredgewidth=1.5)
-            
-            if self.show_labels.get():
-                self.ax.text(point.x + 5, point.y, f"{point.rssi}",
-                           fontsize=8, color='black',
-                           bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1))
+        """Draw point on the map."""
+        if not self.show_points.get():
+            return
+
+        color = rssi_to_color(point.rssi)
+        self.ax.plot(
+            point.x,
+            point.y,
+            marker="o",
+            markersize=8,
+            markerfacecolor=color,
+            markeredgecolor="black",
+            markeredgewidth=1.5,
+            zorder=10,
+        )
+
+        if self.show_labels.get():
+            self.ax.text(
+                point.x + 5,
+                point.y,
+                f"{point.rssi:.0f}",
+                fontsize=8,
+                color="black",
+                zorder=11,
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1),
+            )
     
     def _draw_grid(self):
         """Draw grid overlay"""
@@ -623,33 +945,22 @@ class WiFiHeatmapPro:
             return None
         return np.array(self.image)
 
-    def generate_heatmap(self):
-        """Generate and display heatmap"""
-        if len(self.project.measurements) < 3:
-            messagebox.showwarning("Insufficient Data", "Need at least 3 measurements to generate heatmap.")
+    def show_heatmap_view(self):
+        """Switch to inline heatmap view on the main canvas."""
+        if not can_render_heatmap(len(self.project.measurements)):
+            messagebox.showinfo(
+                "More points needed",
+                f"Add at least {MIN_HEATMAP_POINTS} measurements in different areas to build a heatmap.",
+            )
             return
 
-        try:
-            x_coords = [m.x for m in self.project.measurements]
-            y_coords = [m.y for m in self.project.measurements]
-            z_values = [m.rssi for m in self.project.measurements]
-            title = f"{self.project.metadata.name} - WiFi Coverage Heatmap"
+        self.view_mode.set("overlay")
+        self.refresh_view()
+        self._log("Heatmap overlay shown on map", "SUCCESS")
 
-            fig = create_heatmap_figure(
-                self._heatmap_image_array(),
-                x_coords,
-                y_coords,
-                z_values,
-                self._heatmap_config(),
-                title,
-            )
-            plt.show()
-            plt.close(fig)
-            self._log("Heatmap generated successfully", "SUCCESS")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate heatmap: {e}")
-            self._log(f"Heatmap generation failed: {e}", "ERROR")
+    def generate_heatmap(self):
+        """Backward-compatible alias for show_heatmap_view."""
+        self.show_heatmap_view()
     
     # ==================== IMPORT/EXPORT ====================
     
@@ -735,6 +1046,10 @@ class WiFiHeatmapPro:
             y_coords = [m.y for m in self.project.measurements]
             z_values = [m.rssi for m in self.project.measurements]
             title = f"{self.project.metadata.name} - WiFi Coverage Heatmap"
+            bounds = None
+            if self.image:
+                width, height = self.image.size
+                bounds = image_bounds(width, height)
 
             fig = create_heatmap_figure(
                 self._heatmap_image_array(),
@@ -743,6 +1058,7 @@ class WiFiHeatmapPro:
                 z_values,
                 self._heatmap_config(),
                 title,
+                bounds=bounds,
             )
             fig.savefig(filepath, dpi=300, bbox_inches="tight")
             plt.close(fig)
@@ -873,22 +1189,6 @@ class WiFiHeatmapPro:
         
         ttk.Button(dialog, text="Calculate", command=calculate).pack(pady=4)
         ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=4)
-    
-    def compare_projects(self):
-        """Compare two survey projects"""
-        filepath = filedialog.askopenfilename(
-            title="Select Project to Compare",
-            filetypes=[("WiFi Project", "*.wifiproj"), ("JSON", "*.json")]
-        )
-        if not filepath:
-            return
-        
-        try:
-            self.comparison_project = Project.load_from_file(filepath)
-            messagebox.showinfo("Comparison", "Comparison mode not fully implemented in this version.\nFeature coming soon!")
-            self._log(f"Comparison project loaded: {filepath}", "INFO")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load comparison project: {e}")
     
     # ==================== INFO PANELS ====================
     
