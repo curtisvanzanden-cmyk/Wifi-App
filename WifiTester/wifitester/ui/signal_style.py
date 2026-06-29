@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from matplotlib.patches import Rectangle
 
-# (label, min_dbm inclusive, color)
+# (label, min_dbm exclusive lower bound, color)
 SIGNAL_BANDS = (
     ("Excellent (> -60)", -60, "#22c55e"),
     ("Good (-60 to -70)", -70, "#eab308"),
@@ -12,17 +12,12 @@ SIGNAL_BANDS = (
     ("Poor (< -80)", -90, "#ef4444"),
 )
 
-MIN_HEATMAP_POINTS = 3
-
 
 def rssi_to_color(rssi: float) -> str:
-    if rssi > -60:
-        return "#22c55e"
-    if rssi > -70:
-        return "#eab308"
-    if rssi > -80:
-        return "#f97316"
-    return "#ef4444"
+    for _label, threshold, color in SIGNAL_BANDS:
+        if rssi > threshold:
+            return color
+    return SIGNAL_BANDS[-1][2]
 
 
 def draw_signal_legend(ax) -> None:

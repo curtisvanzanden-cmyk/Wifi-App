@@ -30,6 +30,7 @@ except Exception:
 from wifitester import __version__
 from wifitester.models.project import MeasurementPoint, Project
 from wifitester.services.heatmap import (
+    MIN_HEATMAP_POINTS,
     HeatmapConfig,
     can_render_heatmap,
     create_heatmap_figure,
@@ -41,7 +42,7 @@ from wifitester.services.sampler import median_rssi
 from wifitester.services.settings import load_settings, save_settings
 from wifitester.services.wifi_scanner import WiFiScanner
 from wifitester.ui.dialogs.onboarding import OnboardingWizard, show_onboarding_if_needed
-from wifitester.ui.signal_style import MIN_HEATMAP_POINTS, draw_signal_legend, rssi_to_color
+from wifitester.ui.signal_style import draw_signal_legend, rssi_to_color
 
 
 AUTOSAVE_DIR = Path.home() / ".config" / "wifitester" / "autosave"
@@ -163,8 +164,6 @@ class WiFiHeatmapPro:
         tools_menu.add_command(label="Show Heatmap on Map", command=self.show_heatmap_view, accelerator="Ctrl+G")
         tools_menu.add_command(label="Export Image...", command=self.export_image)
         tools_menu.add_command(label="Generate Report...", command=self.generate_report)
-        tools_menu.add_separator()
-        tools_menu.add_command(label="Calibrate Scale...", command=self.calibrate_dialog)
         
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -958,10 +957,6 @@ class WiFiHeatmapPro:
         self.refresh_view()
         self._log("Heatmap overlay shown on map", "SUCCESS")
 
-    def generate_heatmap(self):
-        """Backward-compatible alias for show_heatmap_view."""
-        self.show_heatmap_view()
-    
     # ==================== IMPORT/EXPORT ====================
     
     def import_csv(self):
@@ -1015,7 +1010,7 @@ class WiFiHeatmapPro:
         try:
             with open(filepath, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=[
-                    'x', 'y', 'rssi', 'timestamp', 'ssid', 'bssid', 'channel', 'note'
+                    'x', 'y', 'rssi', 'timestamp', 'ssid', 'bssid', 'channel'
                 ])
                 writer.writeheader()
                 for m in self.project.measurements:
@@ -1145,51 +1140,6 @@ class WiFiHeatmapPro:
             messagebox.showerror("Error", f"Failed to generate report: {e}")
             self._log(f"Report generation failed: {e}", "ERROR")
     
-    # ==================== TOOLS ====================
-    
-    def calibrate_dialog(self):
-        """Calibrate pixel-to-distance scale"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Calibrate Scale")
-        dialog.geometry("350x250")
-        
-        ttk.Label(dialog, text="Measure a known distance on the floorplan").pack(pady=8)
-        
-        frame = ttk.Frame(dialog)
-        frame.pack(padx=16, pady=8)
-        
-        ttk.Label(frame, text="Distance (pixels):").grid(row=0, column=0, sticky=tk.W, pady=4)
-        px_var = tk.IntVar(value=100)
-        ttk.Spinbox(frame, from_=1, to=10000, textvariable=px_var, width=15).grid(row=0, column=1, pady=4)
-        
-        ttk.Label(frame, text="Real distance:").grid(row=1, column=0, sticky=tk.W, pady=4)
-        real_var = tk.DoubleVar(value=10.0)
-        ttk.Spinbox(frame, from_=0.1, to=1000, textvariable=real_var, width=15, increment=0.1).grid(row=1, column=1, pady=4)
-        
-        ttk.Label(frame, text="Unit:").grid(row=2, column=0, sticky=tk.W, pady=4)
-        unit_var = tk.StringVar(value="meters")
-        ttk.Combobox(frame, textvariable=unit_var, values=["meters", "feet", "cm", "inches"], width=13).grid(row=2, column=1, pady=4)
-        
-        result_label = ttk.Label(dialog, text="", foreground="blue")
-        result_label.pack(pady=8)
-        
-        def calculate():
-            px = px_var.get()
-            real = real_var.get()
-            unit = unit_var.get()
-            
-            if px <= 0 or real <= 0:
-                messagebox.showerror("Invalid", "Values must be positive")
-                return
-            
-            ratio = px / real
-            self.project.metadata.calibration = (ratio, unit)
-            result_label.config(text=f"Scale: {ratio:.3f} pixels per {unit}")
-            self._log(f"Calibration set: {ratio:.3f} pixels/{unit}", "SUCCESS")
-        
-        ttk.Button(dialog, text="Calculate", command=calculate).pack(pady=4)
-        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=4)
-    
     # ==================== INFO PANELS ====================
     
     def update_info_panels(self):
@@ -1256,8 +1206,6 @@ class WiFiHeatmapPro:
             text.append(f"  SSID: {ap_info['ssid']}\n")
             text.append(f"  BSSID: {bssid}\n")
             text.append(f"  Channel: {ap_info['channel']}\n")
-            if ap_info.get('frequency'):
-                text.append(f"  Frequency: {ap_info['frequency']} MHz\n")
             text.append(f"  First Seen: {ap_info['first_seen'][:19]}\n")
             text.append("\n")
         
@@ -1325,23 +1273,17 @@ class WiFiHeatmapPro:
     
     def show_about(self):
         """Show about dialog"""
-        about_text = f"""WiFi Heatmap Pro - IT Professional Suite
+        about_text = f"""WiFi Heatmap Pro
 Version {__version__}
 
-A comprehensive WiFi site survey tool for IT professionals.
+WiFi site survey tool for floorplan-based coverage mapping.
 
-Features:
-• Multi-AP tracking with detailed network info
-• Project management and auto-save
-• Advanced heatmap visualization
-• Statistical analysis and reporting
-• Dead zone detection
-• Export to multiple formats
-• Professional report generation
+• Live signal monitoring and multi-sample measurements
+• Inline heatmap overlay on floorplans
+• Project save/load and CSV export
+• Survey statistics and text reports
 
-Created with Python, Matplotlib, and NumPy
-
-© 2024 - For IT Professionals"""
+Python · Matplotlib · NumPy · SciPy"""
         
         messagebox.showinfo("About WiFi Heatmap Pro", about_text)
 
@@ -1351,15 +1293,6 @@ Created with Python, Matplotlib, and NumPy
 def main():
     """Main application entry point"""
     root = tk.Tk()
-    
-    # Set application icon (if available)
-    try:
-        # You can add icon file here
-        # root.iconbitmap('wifi_icon.ico')
-        pass
-    except:
-        pass
-    
     app = WiFiHeatmapPro(root)
     
     # Handle window close

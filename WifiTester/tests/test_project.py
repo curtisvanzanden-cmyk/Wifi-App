@@ -38,3 +38,18 @@ def test_project_round_trip(tmp_path):
     assert loaded.metadata.name == "Round Trip"
     assert len(loaded.measurements) == 1
     assert loaded.measurements[0].rssi == -55
+
+
+def test_measurement_point_ignores_legacy_fields():
+    data = {
+        "x": 1,
+        "y": 2,
+        "rssi": -55.0,
+        "timestamp": "2025-01-01T00:00:00",
+        "note": "old field",
+        "noise": -95,
+        "frequency": 2400.0,
+    }
+    point = MeasurementPoint.from_dict(data)
+    assert point.rssi == -55.0
+    assert not hasattr(point, "note")

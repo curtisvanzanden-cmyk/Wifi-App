@@ -63,22 +63,17 @@ pytest
 
 ```
 WifiTester/
-├── main.py                 # Application entry point
+├── main.py
 ├── wifitester/
-│   ├── app.py              # Tkinter UI
-│   ├── models/project.py   # Project and measurement models
+│   ├── app.py
+│   ├── models/project.py
 │   ├── services/
-│   │   ├── wifi_scanner.py # Cross-platform WiFi scanning
-│   │   ├── heatmap.py      # Heatmap interpolation and rendering
-│   │   ├── sampler.py      # Multi-sample RSSI median
-│   │   └── settings.py     # User preferences persistence
+│   │   ├── wifi_scanner.py
+│   │   ├── heatmap.py
+│   │   ├── sampler.py
+│   │   └── settings.py
 │   └── ui/
-│       ├── signal_style.py # Colors and map legend
-│       └── dialogs/        # Onboarding wizard
-├── tests/
-└── legacy/                 # Earlier prototype scripts
+│       ├── signal_style.py
+│       └── dialogs/onboarding.py
+└── tests/
 ```
-
-## Legacy scripts
-
-Older prototypes (`Tool.py`, `Tool0.01.py`, `tool0.02.py`) are in `legacy/` for reference. Use `main.py` for all new work.

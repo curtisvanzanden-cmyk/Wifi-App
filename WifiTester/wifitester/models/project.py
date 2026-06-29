@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
 
 @dataclass
 class MeasurementPoint:
-    """Single measurement point with comprehensive metadata."""
+    """Single measurement point on the floorplan."""
 
     x: int
     y: int
@@ -21,18 +21,14 @@ class MeasurementPoint:
     ssid: str = ""
     bssid: str = ""
     channel: int = 0
-    frequency: float = 0.0
-    noise: float = 0.0
-    note: str = ""
-    link_quality: int = 0
-    tx_rate: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @staticmethod
     def from_dict(data: dict) -> MeasurementPoint:
-        return MeasurementPoint(**data)
+        allowed = {field.name for field in fields(MeasurementPoint)}
+        return MeasurementPoint(**{key: value for key, value in data.items() if key in allowed})
 
 
 @dataclass
@@ -46,7 +42,6 @@ class ProjectMetadata:
     created: str
     modified: str
     floorplan_path: str
-    calibration: Optional[Tuple[float, str]] = None
     notes: str = ""
 
     def to_dict(self) -> dict:
@@ -54,12 +49,8 @@ class ProjectMetadata:
 
     @staticmethod
     def from_dict(data: dict) -> ProjectMetadata:
-        calibration = data.get("calibration")
-        if calibration and isinstance(calibration, list):
-            calibration = tuple(calibration)
-        data = dict(data)
-        data["calibration"] = calibration
-        return ProjectMetadata(**data)
+        allowed = {field.name for field in fields(ProjectMetadata)}
+        return ProjectMetadata(**{key: value for key, value in data.items() if key in allowed})
 
 
 class Project:
@@ -108,7 +99,6 @@ class Project:
             self.access_points[point.bssid] = {
                 "ssid": point.ssid,
                 "channel": point.channel,
-                "frequency": point.frequency,
                 "first_seen": point.timestamp,
             }
 
